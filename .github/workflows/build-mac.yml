@@ -22,3 +22,4 @@ jobs:
         with:
           name: kojin-henkan-chan-mac
           path: dist/*.dmg
+
