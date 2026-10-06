@@ -4,7 +4,7 @@ import sys
 from pathlib import Path
 
 from openpyxl import load_workbook
-from openpyxl.utils import get_column_letter
+from openpyxl.utils import column_index_from_string, get_column_letter
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
@@ -19,9 +19,11 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QSpinBox,
     QStatusBar,
     QTabWidget,
     QTableWidget,
@@ -33,8 +35,11 @@ from PySide6.QtWidgets import (
 from .core import (
     APP_NAME,
     APP_VERSION,
+    PersonColumns,
+    PersonConflictError,
     PrivacyToolError,
-    anonymize_workbook,
+    anonymize_workbook_multi,
+    normalize_ranges,
     mapping_is_encrypted,
     restore_html,
 )
@@ -148,10 +153,40 @@ class MainWindow(QMainWindow):
         input_form.addRow("Excelファイル", self.excel_input)
         self.sheet_combo = QComboBox()
         self.sheet_combo.currentTextChanged.connect(self._refresh_preview)
-        input_form.addRow("シート", self.sheet_combo)
+        input_form.addRow("シート（列・範囲を追加する対象）", self.sheet_combo)
         layout.addWidget(input_box)
 
-        range_box = QGroupBox("匿名化する範囲")
+        person_box = QGroupBox("① 人物の列（氏名と社員番号を、同じ人なら1つのIDにまとめる）")
+        person_layout = QGridLayout(person_box)
+        self.person_name_col = QLineEdit()
+        self.person_name_col.setPlaceholderText("例: B")
+        self.person_name_col.setMaximumWidth(80)
+        self.person_id_col = QLineEdit()
+        self.person_id_col.setPlaceholderText("例: A")
+        self.person_id_col.setMaximumWidth(80)
+        self.person_first_row = QSpinBox()
+        self.person_first_row.setRange(1, 1048576)
+        self.person_first_row.setValue(2)
+        add_person_button = QPushButton("このシートの人物列を追加")
+        add_person_button.clicked.connect(self._add_person)
+        person_layout.addWidget(QLabel("氏名の列"), 0, 0)
+        person_layout.addWidget(self.person_name_col, 0, 1)
+        person_layout.addWidget(QLabel("社員番号の列"), 0, 2)
+        person_layout.addWidget(self.person_id_col, 0, 3)
+        person_layout.addWidget(QLabel("データ開始行"), 0, 4)
+        person_layout.addWidget(self.person_first_row, 0, 5)
+        person_layout.addWidget(add_person_button, 0, 6)
+        person_layout.setColumnStretch(7, 1)
+        person_hint = QLabel(
+            "シートごとに列が違う場合は、シートを切り替えて列を指定します（片方の列だけでも可）。"
+            "同じ行の氏名と社員番号は同一人物として扱います。見出し行は開始行で除外します。"
+        )
+        person_hint.setWordWrap(True)
+        person_hint.setStyleSheet("color:#555")
+        person_layout.addWidget(person_hint, 1, 0, 1, 8)
+        layout.addWidget(person_box)
+
+        range_box = QGroupBox("② その他の個人情報のセル範囲（住所・電話番号など。値ごとに別IDになります）")
         range_layout = QGridLayout(range_box)
         self.range_edit = QLineEdit()
         self.range_edit.setPlaceholderText("例: B2:B100 または B2:D100")
@@ -163,13 +198,19 @@ class MainWindow(QMainWindow):
         preview_button = QPushButton("プレビュー選択を追加")
         preview_button.clicked.connect(self._add_preview_selection)
         self.range_list = QListWidget()
-        self.range_list.setMaximumHeight(85)
+        self.range_list.setMinimumHeight(90)
+        self.range_list.setMaximumHeight(140)
         range_layout.addWidget(QLabel("セル範囲"), 0, 0)
+        range_layout.addWidget(QLabel("指定済み"), 2, 0)
         range_layout.addWidget(self.range_edit, 0, 1)
         range_layout.addWidget(add_button, 0, 2)
         range_layout.addWidget(remove_button, 0, 3)
         range_layout.addWidget(preview_button, 0, 4)
-        hint = QLabel("複数の範囲を追加できます。列見出しなど、個人情報ではないセルは除外してください。")
+        hint = QLabel(
+            "シートを切り替えて、シートごとに追加できます。同じ値は別のシートでも同じIDになります。"
+            "列見出しなど、個人情報ではないセルは除外してください。"
+        )
+        hint.setWordWrap(True)
         hint.setStyleSheet("color:#555")
         range_layout.addWidget(hint, 1, 1, 1, 4)
         range_layout.addWidget(self.range_list, 2, 1, 1, 4)
@@ -177,7 +218,7 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(QLabel("Excelプレビュー（先頭200行・50列）"))
         self.preview = QTableWidget()
-        self.preview.setMinimumHeight(360)
+        self.preview.setMinimumHeight(240)
         self.preview.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.preview.setAlternatingRowColors(True)
         layout.addWidget(self.preview, 1)
@@ -260,6 +301,7 @@ class MainWindow(QMainWindow):
             if self.preview_workbook:
                 self.preview_workbook.close()
             self.preview_workbook = load_workbook(path, read_only=True, data_only=False)
+            self.range_list.clear()
             self.sheet_combo.clear()
             self.sheet_combo.addItems(self.preview_workbook.sheetnames)
             self._refresh_preview(self.sheet_combo.currentText())
@@ -288,10 +330,63 @@ class MainWindow(QMainWindow):
         for col in range(columns):
             self.preview.setColumnWidth(col, min(max(self.preview.columnWidth(col), 80), 220))
 
+    def _add_target(self, sheet: str, cell_range: str):
+        label = f"{sheet}!{cell_range}"
+        if self.range_list.findItems(label, Qt.MatchFlag.MatchExactly):
+            return
+        item = QListWidgetItem(label)
+        item.setData(Qt.ItemDataRole.UserRole, ("range", sheet, cell_range))
+        self.range_list.addItem(item)
+
+    def _add_person(self):
+        sheet = self.sheet_combo.currentText()
+        name_col = self.person_name_col.text().strip().upper()
+        id_col = self.person_id_col.text().strip().upper()
+        if not sheet:
+            self._warning("シート未選択", "先にExcelファイルを選択してください。")
+            return
+        if not name_col and not id_col:
+            self._warning("列未指定", "氏名の列と社員番号の列の、少なくとも一方を入力してください。")
+            return
+        for label, col in (("氏名", name_col), ("社員番号", id_col)):
+            if col:
+                try:
+                    column_index_from_string(col)
+                except ValueError:
+                    self._warning("列指定エラー", f"{label}の列は A, B, AA のような列記号で入力してください: {col}")
+                    return
+        if name_col and name_col == id_col:
+            self._warning("列指定エラー", "氏名の列と社員番号の列に同じ列は指定できません。")
+            return
+        first_row = self.person_first_row.value()
+        parts = []
+        if name_col:
+            parts.append(f"氏名={name_col}")
+        if id_col:
+            parts.append(f"社員番号={id_col}")
+        label = f"{sheet}! 人物列 {' '.join(parts)}（{first_row}行目〜）"
+        if self.range_list.findItems(label, Qt.MatchFlag.MatchExactly):
+            return
+        item = QListWidgetItem(label)
+        item.setData(Qt.ItemDataRole.UserRole, ("person", sheet, name_col or None, id_col or None, first_row))
+        self.range_list.addItem(item)
+        self.person_name_col.clear()
+        self.person_id_col.clear()
+
     def _add_range(self):
-        value = self.range_edit.text().strip().upper().replace("$", "")
-        if value and not self.range_list.findItems(value, Qt.MatchFlag.MatchExactly):
-            self.range_list.addItem(value)
+        sheet = self.sheet_combo.currentText()
+        text = self.range_edit.text().strip()
+        if not sheet:
+            self._warning("シート未選択", "先にExcelファイルを選択してください。")
+            return
+        if text:
+            try:
+                ranges = normalize_ranges([text])
+            except PrivacyToolError as exc:
+                self._warning("範囲エラー", str(exc))
+                return
+            for value in ranges:
+                self._add_target(sheet, value)
         self.range_edit.clear()
 
     def _remove_ranges(self):
@@ -307,8 +402,7 @@ class MainWindow(QMainWindow):
             start = f"{get_column_letter(selected.leftColumn() + 1)}{selected.topRow() + 1}"
             end = f"{get_column_letter(selected.rightColumn() + 1)}{selected.bottomRow() + 1}"
             value = start if start == end else f"{start}:{end}"
-            if not self.range_list.findItems(value, Qt.MatchFlag.MatchExactly):
-                self.range_list.addItem(value)
+            self._add_target(self.sheet_combo.currentText(), value)
 
     def _encryption_toggled(self, enabled: bool):
         self.password.setEnabled(enabled)
@@ -329,12 +423,26 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("暗号化されていない対応表です。")
 
     def _anonymize(self):
-        ranges = [self.range_list.item(i).text() for i in range(self.range_list.count())]
         if self.range_edit.text().strip():
-            ranges.append(self.range_edit.text().strip())
-        if not all([self.excel_input.text(), self.sheet_combo.currentText(), self.excel_output.text(), self.map_output.text()]):
-            self._warning("入力不足", "入力ファイル、シート、保存先を指定してください。")
+            self._add_range()
+        entries = [
+            self.range_list.item(i).data(Qt.ItemDataRole.UserRole)
+            for i in range(self.range_list.count())
+        ]
+        targets = [e for e in entries if e[0] == "range"]
+        person_columns = [
+            PersonColumns(sheet=e[1], name_col=e[2], id_col=e[3], first_row=e[4])
+            for e in entries if e[0] == "person"
+        ]
+        if not all([self.excel_input.text(), self.excel_output.text(), self.map_output.text()]):
+            self._warning("入力不足", "入力ファイルと保存先を指定してください。")
             return
+        if not targets and not person_columns:
+            self._warning("範囲未指定", "人物の列、またはセル範囲を1つ以上追加してください。")
+            return
+        grouped: dict[str, list[str]] = {}
+        for _kind, sheet, cell_range in targets:
+            grouped.setdefault(sheet, []).append(cell_range)
         password = None
         if self.encrypt_check.isChecked():
             password = self.password.text()
@@ -354,22 +462,60 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("匿名化して保存中...")
         QApplication.processEvents()
         try:
-            result = anonymize_workbook(
-                self.excel_input.text(), self.excel_output.text(), self.map_output.text(),
-                self.sheet_combo.currentText(), ranges, password
-            )
+            def run(allow_conflicts: bool):
+                return anonymize_workbook_multi(
+                    self.excel_input.text(), self.excel_output.text(), self.map_output.text(),
+                    list(grouped.items()), password, person_columns, allow_conflicts
+                )
+
+            try:
+                result = run(False)
+            except PersonConflictError as conflict:
+                QApplication.restoreOverrideCursor()
+                proceed = self._confirm_conflicts(conflict.conflicts)
+                QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+                if not proceed:
+                    self.statusBar().showMessage("キャンセルしました（何も保存していません）")
+                    return
+                result = run(True)
             self.statusBar().showMessage("匿名化が完了しました")
+            person_line = f"人物（IDの数）: {result.person_count}\n" if person_columns else ""
+            conflict_line = (
+                f"\n※ 複数の社員番号/氏名があった人物: {len(result.conflicts)}件（同一人物としてまとめました）\n"
+                if result.conflicts else ""
+            )
+            sheet_lines = "\n".join(
+                f"  ・{name}: {count}セル" for name, count in result.replaced_by_sheet.items()
+            )
             QMessageBox.information(
                 self, "匿名化完了",
-                f"匿名化Excelと対応表を保存しました。\n\n置換セル: {result.replaced_cells}\n"
-                f"異なる値: {result.unique_values}\n空白スキップ: {result.skipped_blank_cells}\n"
-                f"数式スキップ: {result.skipped_formula_cells}\n\nAIへ渡すのは匿名化Excelだけです。"
+                f"匿名化Excelと対応表を保存しました。\n\n置換セル: {result.replaced_cells}\n{sheet_lines}\n{person_line}"
+                f"異なる値（シートをまたぐ同一値は1つ）: {result.unique_values}\n空白スキップ: {result.skipped_blank_cells}\n"
+                f"数式スキップ: {result.skipped_formula_cells}\n{conflict_line}\nAIへ渡すのは匿名化Excelだけです。"
             )
         except Exception as exc:
             self.statusBar().showMessage("処理に失敗しました")
             self._error("処理エラー", str(exc))
         finally:
             QApplication.restoreOverrideCursor()
+
+    def _confirm_conflicts(self, conflicts) -> bool:
+        lines = [c.describe() for c in conflicts]
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("確認が必要です")
+        box.setText(
+            f"同じ人物に複数の社員番号（または、同じ社員番号に複数の氏名）が{len(conflicts)}件見つかりました。\n\n"
+            "契約社員から正社員への登用などで社員番号が変わった場合は、同一人物として1つのIDにまとめます。\n"
+            "ただし同姓同名の別人の場合も、同じIDにまとめられてしまいます。\n"
+            "「詳細を表示」で内容を確認してください。まとめて続行しますか？"
+        )
+        box.setDetailedText("\n\n".join(lines))
+        proceed = box.addButton("同一人物としてまとめて続行", QMessageBox.ButtonRole.AcceptRole)
+        cancel = box.addButton("キャンセル（保存しない）", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(cancel)
+        box.exec()
+        return box.clickedButton() is proceed
 
     def _restore(self):
         if not all([self.html_input.text(), self.restore_map.text(), self.html_output.text()]):
