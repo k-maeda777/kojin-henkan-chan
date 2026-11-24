@@ -13,6 +13,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QFileDialog,
     QFormLayout,
+    QFrame,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
@@ -23,6 +24,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QSpinBox,
     QStatusBar,
     QTabWidget,
@@ -42,6 +44,7 @@ from .core import (
     normalize_ranges,
     mapping_is_encrypted,
     restore_html,
+    restore_workbook,
 )
 
 
@@ -133,14 +136,23 @@ class MainWindow(QMainWindow):
         title_font = "Hiragino Sans" if sys.platform == "darwin" else "Yu Gothic UI"
         title.setFont(QFont(title_font, 18, QFont.Weight.Bold))
         outer.addWidget(title)
-        outer.addWidget(QLabel("個人情報を仮IDに置き換え、AI分析後のHTMLだけを安全に復元します。処理は端末内で完結します。"))
+        outer.addWidget(QLabel("個人情報を仮IDに置き換え、AI分析後のHTMLや、匿名化したExcelを安全に復元します。処理は端末内で完結します。"))
         tabs = QTabWidget()
-        tabs.addTab(self._anonymize_tab(), "1. Excelを匿名化")
+        tabs.addTab(self._scrollable(self._anonymize_tab()), "1. Excelを匿名化")
         tabs.addTab(self._restore_tab(), "2. HTMLを復元")
+        tabs.addTab(self._restore_excel_tab(), "3. 匿名化済みExcelを復元")
         outer.addWidget(tabs, 1)
         self.setCentralWidget(root)
         self.setStatusBar(QStatusBar())
         self.statusBar().showMessage("準備完了")
+
+    @staticmethod
+    def _scrollable(widget: QWidget) -> QScrollArea:
+        area = QScrollArea()
+        area.setWidgetResizable(True)
+        area.setFrameShape(QFrame.Shape.NoFrame)
+        area.setWidget(widget)
+        return area
 
     def _anonymize_tab(self):
         tab = QWidget()
@@ -155,6 +167,27 @@ class MainWindow(QMainWindow):
         self.sheet_combo.currentTextChanged.connect(self._refresh_preview)
         input_form.addRow("シート（列・範囲を追加する対象）", self.sheet_combo)
         layout.addWidget(input_box)
+
+        self.append_box = QGroupBox("匿名化済みのExcelに追加したシートを匿名化する（既存の対応表を引き継ぐ）")
+        self.append_box.setCheckable(True)
+        self.append_box.setChecked(False)
+        append_form = QFormLayout(self.append_box)
+        self.base_map = PathRow("対応表 (*.epbmap)")
+        self.base_map.on_chosen = self._base_map_chosen
+        self.base_password = QLineEdit()
+        self.base_password.setEchoMode(QLineEdit.EchoMode.Password)
+        append_form.addRow("既存の対応表", self.base_map)
+        append_form.addRow("パスワード", self.base_password)
+        append_hint = QLabel(
+            "使い方: 匿名化済みのExcelに、個人情報のままのシートを追加して保存します。上の「Excelファイル」にそのExcelを選び、"
+            "下の①②で追加したシートの列・範囲だけを指定してください。既存のシートと同じ人には同じID、新しい人には続きのIDが付きます。"
+            "匿名化済みのシートは変更されません。"
+        )
+        append_hint.setWordWrap(True)
+        append_hint.setStyleSheet("color:#555")
+        append_form.addRow("", append_hint)
+        self.append_box.toggled.connect(self._append_toggled)
+        layout.addWidget(self.append_box)
 
         person_box = QGroupBox("① 人物の列（氏名と社員番号を、同じ人なら1つのIDにまとめる）")
         person_layout = QGridLayout(person_box)
@@ -239,6 +272,14 @@ class MainWindow(QMainWindow):
         self.password_confirm.setEchoMode(QLineEdit.EchoMode.Password)
         output_form.addRow("パスワード", self.password)
         output_form.addRow("確認", self.password_confirm)
+        self.append_output_note = QLabel(
+            "追加モード: 既存の対応表と同じパスワードで暗号化して保存します（既存が暗号化されていない場合は暗号化しません）。"
+            "元の対応表は上書きしません。今後の復元には、保存した更新後の対応表を使ってください。"
+        )
+        self.append_output_note.setWordWrap(True)
+        self.append_output_note.setStyleSheet("color:#555")
+        self.append_output_note.setVisible(False)
+        output_form.addRow("", self.append_output_note)
         action_row = QWidget()
         action_layout = QHBoxLayout(action_row)
         action_layout.setContentsMargins(0, 3, 0, 0)
@@ -292,10 +333,43 @@ class MainWindow(QMainWindow):
         layout.addStretch()
         return tab
 
+    def _suggest_outputs(self, excel_path: str | None = None):
+        path = excel_path or self.excel_input.text()
+        if not path:
+            return
+        source = Path(path)
+        if self.append_box.isChecked():
+            self.excel_output.edit.setText(str(source.with_name(f"{source.stem}_updated.xlsx")))
+            base = self.base_map.text()
+            if base:
+                self.map_output.edit.setText(str(Path(base).with_name(f"{Path(base).stem}_updated.epbmap")))
+            else:
+                self.map_output.edit.setText(str(source.with_name(f"{source.stem}_updated.epbmap")))
+        else:
+            self.excel_output.edit.setText(str(source.with_name(f"{source.stem}_anonymized.xlsx")))
+            self.map_output.edit.setText(str(source.with_name(f"{source.stem}_anonymized.epbmap")))
+
+    def _append_toggled(self, checked: bool):
+        self.encrypt_check.setEnabled(not checked)
+        if checked:
+            self.password.setEnabled(False)
+            self.password_confirm.setEnabled(False)
+        else:
+            self._encryption_toggled(self.encrypt_check.isChecked())
+        self.append_output_note.setVisible(checked)
+        self._suggest_outputs()
+
+    def _base_map_chosen(self, path: str):
+        if mapping_is_encrypted(path):
+            self.statusBar().showMessage("暗号化された対応表です。パスワードを入力してください。")
+            self.base_password.setFocus()
+        else:
+            self.statusBar().showMessage("暗号化されていない対応表です。")
+        self._suggest_outputs()
+
     def _excel_chosen(self, path: str):
         source = Path(path)
-        self.excel_output.edit.setText(str(source.with_name(f"{source.stem}_anonymized.xlsx")))
-        self.map_output.edit.setText(str(source.with_name(f"{source.stem}_anonymized.epbmap")))
+        self._suggest_outputs(path)
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
             if self.preview_workbook:
@@ -443,8 +517,21 @@ class MainWindow(QMainWindow):
         grouped: dict[str, list[str]] = {}
         for _kind, sheet, cell_range in targets:
             grouped.setdefault(sheet, []).append(cell_range)
+        append = self.append_box.isChecked()
+        base_map = base_password = None
+        if append:
+            base_map = self.base_map.text()
+            if not base_map:
+                self._warning("入力不足", "追加モードでは、既存の対応表を指定してください。")
+                return
+            base_password = self.base_password.text() or None
+            if mapping_is_encrypted(base_map) and not base_password:
+                self._warning("パスワード未入力", "既存の対応表は暗号化されています。パスワードを入力してください。")
+                return
         password = None
-        if self.encrypt_check.isChecked():
+        if append:
+            password = base_password if mapping_is_encrypted(base_map) else None
+        elif self.encrypt_check.isChecked():
             password = self.password.text()
             if not password:
                 self._warning("パスワード未入力", "暗号化パスワードを入力してください。")
@@ -465,7 +552,8 @@ class MainWindow(QMainWindow):
             def run(allow_conflicts: bool):
                 return anonymize_workbook_multi(
                     self.excel_input.text(), self.excel_output.text(), self.map_output.text(),
-                    list(grouped.items()), password, person_columns, allow_conflicts
+                    list(grouped.items()), password, person_columns, allow_conflicts,
+                    base_map_path=base_map, base_map_password=base_password,
                 )
 
             try:
@@ -481,15 +569,24 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("匿名化が完了しました")
             person_line = f"人物（IDの数）: {result.person_count}\n" if person_columns else ""
             conflict_line = (
-                f"\n※ 複数の社員番号/氏名があった人物: {len(result.conflicts)}件（同一人物としてまとめました）\n"
+                f"\n※ 確認が必要だった項目: {len(result.conflicts)}件（内容を確認の上、続行しました）\n"
                 if result.conflicts else ""
             )
             sheet_lines = "\n".join(
                 f"  ・{name}: {count}セル" for name, count in result.replaced_by_sheet.items()
             )
+            if append:
+                person_line = (
+                    f"新しく追加した人物: {result.new_persons}\n既存のIDを再利用した値: {result.reused_ids}\n"
+                    f"匿名化済みのためスキップ: {result.skipped_token_cells}セル\n人物（IDの数、合計）: {result.person_count}\n"
+                )
+            headline = (
+                "追加したシートを匿名化し、更新後の対応表を保存しました。\n（元の対応表は変更していません。今後はこの更新後の対応表を使ってください）"
+                if append else "匿名化Excelと対応表を保存しました。"
+            )
             QMessageBox.information(
                 self, "匿名化完了",
-                f"匿名化Excelと対応表を保存しました。\n\n置換セル: {result.replaced_cells}\n{sheet_lines}\n{person_line}"
+                f"{headline}\n\n置換セル: {result.replaced_cells}\n{sheet_lines}\n{person_line}"
                 f"異なる値（シートをまたぐ同一値は1つ）: {result.unique_values}\n空白スキップ: {result.skipped_blank_cells}\n"
                 f"数式スキップ: {result.skipped_formula_cells}\n{conflict_line}\nAIへ渡すのは匿名化Excelだけです。"
             )
@@ -504,18 +601,124 @@ class MainWindow(QMainWindow):
         box = QMessageBox(self)
         box.setIcon(QMessageBox.Icon.Warning)
         box.setWindowTitle("確認が必要です")
+        kinds = {c.kind for c in conflicts}
+        parts = []
+        if kinds & {"multi_id", "multi_name"}:
+            parts.append(
+                "同じ人物に複数の社員番号（または、同じ社員番号に複数の氏名）が見つかりました。\n"
+                "契約社員から正社員への登用などで社員番号が変わった場合は、同一人物として1つのIDにまとめます。\n"
+                "ただし同姓同名の別人の場合も、同じIDにまとめられてしまいます。"
+            )
+        if "merge_existing" in kinds:
+            parts.append(
+                "すでに別のIDを付けた人が、追加したシートでは同一人物になっています。\n"
+                "付与済みのIDは変更できないため、統合せず、別々のIDのまま続行します。"
+            )
         box.setText(
-            f"同じ人物に複数の社員番号（または、同じ社員番号に複数の氏名）が{len(conflicts)}件見つかりました。\n\n"
-            "契約社員から正社員への登用などで社員番号が変わった場合は、同一人物として1つのIDにまとめます。\n"
-            "ただし同姓同名の別人の場合も、同じIDにまとめられてしまいます。\n"
-            "「詳細を表示」で内容を確認してください。まとめて続行しますか？"
+            f"確認が必要な項目が{len(conflicts)}件あります。\n\n" + "\n\n".join(parts)
+            + "\n\n「詳細を表示」で内容を確認してください。続行しますか？"
         )
         box.setDetailedText("\n\n".join(lines))
-        proceed = box.addButton("同一人物としてまとめて続行", QMessageBox.ButtonRole.AcceptRole)
+        proceed = box.addButton("内容を確認した上で続行", QMessageBox.ButtonRole.AcceptRole)
         cancel = box.addButton("キャンセル（保存しない）", QMessageBox.ButtonRole.RejectRole)
         box.setDefaultButton(cancel)
         box.exec()
         return box.clickedButton() is proceed
+
+    def _restore_excel_tab(self):
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        box = QGroupBox("匿名化済みExcelを元の値に戻す")
+        form = QFormLayout(box)
+        self.xl_restore_input = PathRow("Excelブック (*.xlsx)")
+        self.xl_restore_input.on_chosen = self._xl_restore_chosen
+        self.xl_restore_map = PathRow("対応表 (*.epbmap)")
+        self.xl_restore_map.on_chosen = self._xl_restore_map_chosen
+        self.xl_restore_password = QLineEdit()
+        self.xl_restore_password.setEchoMode(QLineEdit.EchoMode.Password)
+        self.xl_restore_output = PathRow("Excelブック (*.xlsx)", save=True)
+        form.addRow("匿名化済みExcel", self.xl_restore_input)
+        form.addRow("対応表", self.xl_restore_map)
+        form.addRow("パスワード", self.xl_restore_password)
+        password_hint = QLabel("暗号化していない対応表では空欄のままにします。")
+        password_hint.setStyleSheet("color:#555")
+        form.addRow("", password_hint)
+        form.addRow("復元Excel", self.xl_restore_output)
+        action_row = QWidget()
+        action_layout = QHBoxLayout(action_row)
+        action_layout.setContentsMargins(0, 3, 0, 0)
+        action_layout.addStretch()
+        self.xl_restore_button = QPushButton("IDを元の値に戻して保存")
+        self.xl_restore_button.setMinimumHeight(34)
+        self.xl_restore_button.clicked.connect(self._restore_excel)
+        action_layout.addWidget(self.xl_restore_button)
+        form.addRow("", action_row)
+        layout.addWidget(box)
+
+        note = QGroupBox("ご注意")
+        note_layout = QVBoxLayout(note)
+        note_layout.addWidget(QLabel(
+            "・全シートの仮IDを元の値に戻します（数値は数値のまま戻ります）。\n"
+            "・復元Excelには個人情報が含まれます。保存先と共有範囲に注意し、AIには渡さないでください。\n"
+            "・数式のセルは対象外です。仮IDを文章の途中に含むセルは、その部分だけ戻します。\n"
+            "・氏名の表記ゆれ（スペースの違いなど）は、最初に出てきた表記に統一されます。\n"
+            "・シートを追加して匿名化した場合は、更新後の対応表（_updated）を使ってください。"
+        ))
+        layout.addWidget(note)
+        layout.addStretch()
+        return tab
+
+    def _xl_restore_chosen(self, path: str):
+        source = Path(path)
+        stem = source.stem[: -len("_anonymized")] if source.stem.endswith("_anonymized") else source.stem
+        self.xl_restore_output.edit.setText(str(source.with_name(f"{stem}_restored.xlsx")))
+        guessed = source.with_suffix(".epbmap")
+        if not self.xl_restore_map.text() and guessed.exists():
+            self.xl_restore_map.edit.setText(str(guessed))
+            self._xl_restore_map_chosen(str(guessed))
+
+    def _xl_restore_map_chosen(self, path: str):
+        if mapping_is_encrypted(path):
+            self.statusBar().showMessage("暗号化された対応表です。パスワードを入力してください。")
+            self.xl_restore_password.setFocus()
+        else:
+            self.statusBar().showMessage("暗号化されていない対応表です。")
+
+    def _restore_excel(self):
+        if not all([self.xl_restore_input.text(), self.xl_restore_map.text(), self.xl_restore_output.text()]):
+            self._warning("入力不足", "匿名化済みExcel、対応表、保存先を指定してください。")
+            return
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        self.statusBar().showMessage("Excelを復元中...")
+        QApplication.processEvents()
+        try:
+            result = restore_workbook(
+                self.xl_restore_input.text(), self.xl_restore_map.text(), self.xl_restore_output.text(),
+                self.xl_restore_password.text() or None,
+            )
+            sheet_lines = "\n".join(f"  ・{name}: {count}セル" for name, count in result.restored_by_sheet.items())
+            notes = []
+            if result.unknown_tokens:
+                notes.append(f"※ 対応表にないID: {len(result.unknown_tokens)}件（そのまま残しています）")
+            if result.skipped_formula_cells:
+                notes.append(f"※ 数式のセルは対象外にしました: {result.skipped_formula_cells}セル")
+            if result.missing_expected_tokens:
+                notes.append(
+                    f"対応表にあるがこのExcelに無いID: {len(result.missing_expected_tokens)}件"
+                    "（匿名化後に消したシートがある場合などは正常です）"
+                )
+            self.statusBar().showMessage("Excelの復元が完了しました")
+            QMessageBox.information(
+                self, "復元完了",
+                f"復元Excelを保存しました。\n\n復元したセル: {result.restored_cells}\n{sheet_lines}\n\n"
+                + ("\n".join(notes) if notes else "ID検査: 問題なし")
+            )
+        except Exception as exc:
+            self.statusBar().showMessage("処理に失敗しました")
+            title = "処理エラー" if isinstance(exc, PrivacyToolError) else "予期しないエラー"
+            self._error(title, str(exc))
+        finally:
+            QApplication.restoreOverrideCursor()
 
     def _restore(self):
         if not all([self.html_input.text(), self.restore_map.text(), self.html_output.text()]):

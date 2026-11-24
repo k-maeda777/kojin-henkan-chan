@@ -15,6 +15,7 @@ from excel_privacy_tool.core import (
     anonymize_workbook_multi,
     load_mapping,
     restore_html,
+    restore_workbook,
 )
 
 
@@ -269,6 +270,197 @@ class CoreWorkflowTests(unittest.TestCase):
                 anonymize_workbook_multi(
                     source, self.root / "v.xlsx", self.root / "v.epbmap", person_columns=[spec]
                 )
+
+    # ---- Excelの復元 -------------------------------------------------------------
+
+    def _anonymized_person_book(self):
+        source = self._person_source()
+        anon, map_path = self.root / "anon1.xlsx", self.root / "map1.epbmap"
+        anonymize_workbook_multi(
+            source, anon, map_path, password="pw", person_columns=self._person_specs()
+        )
+        return source, anon, map_path
+
+    def test_restore_workbook_round_trip_keeps_types(self):
+        source, anon, map_path = self._anonymized_person_book()
+        restored = self.root / "restored.xlsx"
+        result = restore_workbook(anon, map_path, restored, "pw")
+        self.assertEqual(result.restored_cells, 8)  # 正社員4 + 評価2 + 研修2
+        self.assertFalse(result.unknown_tokens)
+
+        wb = load_workbook(restored)
+        staff, review, training = wb["正社員"], wb["評価"], wb["研修"]
+        self.assertEqual(staff["A2"].value, 1001)  # 数値は数値のまま戻る
+        self.assertIsInstance(staff["A2"].value, int)
+        self.assertEqual(staff["B2"].value, "山田 太郎")
+        self.assertEqual(staff["C2"].value, "営業")
+        self.assertEqual(review["A2"].value, "山田 太郎")  # 表記ゆれは最初の表記に統一される
+        self.assertEqual(training["C2"].value, 1001)
+        self.assertEqual(staff["A1"].value, "社員番号")
+
+    def test_restore_workbook_dates_floats_and_errors(self):
+        from datetime import datetime
+
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.title = "S"
+        sheet.append(["名前", "入社日", "係数"])
+        sheet.append(["山田", datetime(2026, 4, 10), 3.5])
+        source = self.root / "types.xlsx"
+        workbook.save(source)
+        anon, map_path = self.root / "types_anon.xlsx", self.root / "types.epbmap"
+        anonymize_workbook_multi(source, anon, map_path, [("S", ["A2:C2"])], "pw")
+        restored = self.root / "types_restored.xlsx"
+        restore_workbook(anon, map_path, restored, "pw")
+        row = [c.value for c in load_workbook(restored)["S"][2]]
+        self.assertEqual(row, ["山田", datetime(2026, 4, 10), 3.5])
+
+        with self.assertRaises(WrongPasswordError):
+            restore_workbook(anon, map_path, self.root / "x.xlsx", "wrong")
+        with self.assertRaises(PrivacyToolError):
+            restore_workbook(anon, map_path, anon, "pw")  # 上書きは不可
+        with self.assertRaises(PrivacyToolError):  # 仮IDのないExcelは対応表と合わない
+            restore_workbook(source, map_path, self.root / "y.xlsx", "pw")
+
+    def test_restore_workbook_flags_unknown_token_in_text(self):
+        source, anon, map_path = self._anonymized_person_book()
+        wb = load_workbook(anon)
+        token = wb["正社員"]["B2"].value
+        wb["正社員"]["C2"] = f"{token}さん担当 / {token}_E9"  # _E9 は対応表にないID
+        wb.save(anon)
+        restored = self.root / "r2.xlsx"
+        result = restore_workbook(anon, map_path, restored, "pw")
+        self.assertEqual(load_workbook(restored)["正社員"]["C2"].value, f"山田 太郎さん担当 / {token}_E9")
+        self.assertEqual(result.unknown_tokens, [f"{token}_E9"])
+
+    # ---- 匿名化済みExcelへのシート追加 ----------------------------------------------
+
+    def _add_new_sheet(self, anon, rows, name="新規"):
+        wb = load_workbook(anon)
+        sheet = wb.create_sheet(name)
+        sheet.append(["氏名", "社員番号"])
+        for row in rows:
+            sheet.append(list(row))
+        plus = self.root / "plus.xlsx"
+        wb.save(plus)
+        return plus
+
+    def _append(self, plus, base_map, allow=False, password="pw", **kwargs):
+        out, map_path = self.root / "anon2.xlsx", self.root / "map2.epbmap"
+        result = anonymize_workbook_multi(
+            plus, out, map_path, password=password,
+            person_columns=[PersonColumns("新規", name_col="A", id_col="B")],
+            allow_conflicts=allow, base_map_path=base_map, base_map_password=password, **kwargs,
+        )
+        return result, out, map_path
+
+    def test_append_sheet_shares_ids_with_existing(self):
+        _, anon, map1 = self._anonymized_person_book()
+        before = load_workbook(anon)
+        base1 = before["正社員"]["B2"].value  # 山田
+        plus = self._add_new_sheet(anon, [("山田　太郎", 1001), ("田中 次郎", 3001), (None, 1002)])
+        result, out, map2 = self._append(plus, map1)
+
+        wb = load_workbook(out)
+        new, staff = wb["新規"], wb["正社員"]
+        prefix = base1.rsplit("_", 1)[0]
+        self.assertEqual(new["A2"].value, base1)  # 既存の人は同じID
+        self.assertEqual(new["B2"].value, base1 + "_E1")
+        self.assertEqual(new["A3"].value, f"{prefix}_000003")  # 新しい人は続き番号（既存は山田・佐藤の2人）
+        self.assertEqual(new["B3"].value, f"{prefix}_000003_E1")
+        self.assertEqual(new["B4"].value, before["正社員"]["A3"].value)  # 社員番号だけでも既存の人に結びつく
+        self.assertEqual(new["A1"].value, "氏名")
+        for row in range(1, 4):  # すでに匿名化したシートは1セルも変わらない
+            for col in range(1, 4):
+                self.assertEqual(staff.cell(row, col).value, before["正社員"].cell(row, col).value)
+        self.assertEqual((result.new_persons, result.reused_ids, result.person_count), (1, 3, 3))
+        self.assertEqual(result.replaced_by_sheet, {"新規": 5})
+
+        # 更新後の対応表だけで、全シートが元に戻る。古い対応表は変わらない
+        restored = self.root / "all_restored.xlsx"
+        restore_workbook(out, map2, restored, "pw")
+        rwb = load_workbook(restored)
+        self.assertEqual(rwb["新規"]["A3"].value, "田中 次郎")
+        self.assertEqual(rwb["新規"]["B3"].value, 3001)
+        self.assertEqual(rwb["正社員"]["B2"].value, "山田 太郎")
+        old = load_mapping(map1, "pw")["values"]
+        new = load_mapping(map2, "pw")
+        self.assertTrue(set(old) < set(new["values"]))
+        self.assertEqual(len(new["updates"]), 1)
+        restore_workbook(anon, map1, self.root / "old_restored.xlsx", "pw")
+
+    def test_append_skips_already_anonymized_cells(self):
+        _, anon, map1 = self._anonymized_person_book()
+        before = load_workbook(anon)["正社員"]["B2"].value
+        plus = self._add_new_sheet(anon, [("田中 次郎", 3001)])
+        out, map2 = self.root / "s.xlsx", self.root / "s.epbmap"
+        with self.assertRaises(PrivacyToolError):  # 匿名化済みシートだけを指定しても何も起きない
+            anonymize_workbook_multi(
+                plus, out, map2, [("正社員", ["A2:B3"])], "pw", base_map_path=map1, base_map_password="pw"
+            )
+        result = anonymize_workbook_multi(
+            plus, out, map2, [("正社員", ["A2:B3"])], "pw",
+            person_columns=[PersonColumns("新規", name_col="A", id_col="B")],
+            base_map_path=map1, base_map_password="pw",
+        )
+        self.assertEqual(result.skipped_token_cells, 4)
+        self.assertEqual(load_workbook(out)["正社員"]["B2"].value, before)
+
+    def test_append_new_number_for_existing_person_is_alerted(self):
+        _, anon, map1 = self._anonymized_person_book()
+        base1 = load_workbook(anon)["正社員"]["B2"].value
+        plus = self._add_new_sheet(anon, [("山田 太郎", 2001)])  # 登用で社員番号が変わった
+        with self.assertRaises(PersonConflictError) as ctx:
+            self._append(plus, map1)
+        self.assertFalse((self.root / "anon2.xlsx").exists())
+        conflict = ctx.exception.conflicts[0]
+        self.assertEqual(conflict.kind, "multi_id")
+        self.assertIn("2001", conflict.values)
+        _, out, map2 = self._append(plus, map1, allow=True)
+        self.assertEqual(load_workbook(out)["新規"]["B2"].value, base1 + "_E2")  # 1001がE1なので続きのE2
+        self.assertEqual(load_mapping(map2, "pw")["values"][base1 + "_E2"], "2001")
+
+    def test_append_linking_two_existing_people_is_alerted_not_merged(self):
+        _, anon, map1 = self._anonymized_person_book()
+        wb = load_workbook(anon)
+        yamada, sato_no = wb["正社員"]["B2"].value, wb["正社員"]["A3"].value
+        plus = self._add_new_sheet(anon, [("山田 太郎", 1002)])  # 山田さんと佐藤さんの番号が同じ行に
+        with self.assertRaises(PersonConflictError) as ctx:
+            self._append(plus, map1)
+        self.assertIn("merge_existing", [c.kind for c in ctx.exception.conflicts])
+        _, out, _ = self._append(plus, map1, allow=True)
+        new = load_workbook(out)["新規"]
+        self.assertEqual((new["A2"].value, new["B2"].value), (yamada, sato_no))  # 既存のIDはそのまま
+
+    def test_append_with_legacy_map_without_roles_and_kinds(self):
+        source = self._person_source()
+        anon, map1 = self.root / "l_anon.xlsx", self.root / "l.epbmap"
+        anonymize_workbook_multi(
+            source, anon, map1, password=None, person_columns=self._person_specs()
+        )
+        wrapper = json.loads(map1.read_text(encoding="utf-8"))
+        for key in ("token_roles", "kinds"):  # 0.3.0 までの対応表には無い項目
+            wrapper["payload"].pop(key)
+        map1.write_text(json.dumps(wrapper, ensure_ascii=False), encoding="utf-8")
+        base1 = load_workbook(anon)["正社員"]["B2"].value
+        plus = self._add_new_sheet(anon, [("山田 太郎", 1001), ("鈴木 三郎", 4001)])
+        out, map2 = self.root / "l_out.xlsx", self.root / "l_out.epbmap"
+        result = anonymize_workbook_multi(
+            plus, out, map2, person_columns=[PersonColumns("新規", name_col="A", id_col="B")],
+            base_map_path=map1,
+        )
+        self.assertEqual(load_workbook(out)["新規"]["A2"].value, base1)
+        self.assertEqual(result.new_persons, 1)
+
+    def test_append_rejects_same_map_path(self):
+        _, anon, map1 = self._anonymized_person_book()
+        plus = self._add_new_sheet(anon, [("田中 次郎", 3001)])
+        with self.assertRaises(PrivacyToolError):
+            anonymize_workbook_multi(
+                plus, self.root / "z.xlsx", map1, password="pw",
+                person_columns=[PersonColumns("新規", name_col="A", id_col="B")],
+                base_map_path=map1, base_map_password="pw",
+            )
 
 
 if __name__ == "__main__":

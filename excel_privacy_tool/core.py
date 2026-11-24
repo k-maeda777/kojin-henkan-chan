@@ -8,7 +8,7 @@ import re
 import secrets
 import unicodedata
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
+from datetime import date, datetime, time, timezone
 from pathlib import Path
 from typing import Iterable
 
@@ -21,7 +21,7 @@ from openpyxl.utils.cell import column_index_from_string, range_boundaries
 
 
 APP_NAME = "個人情報変換ちゃん"
-APP_VERSION = "0.3.0"
+APP_VERSION = "0.4.0"
 ENCRYPTED_FORMAT = "excel-privacy-bridge-map-v1"
 PLAIN_FORMAT = "excel-privacy-bridge-map-plain-v1"
 KDF_ITERATIONS = 600_000
@@ -47,6 +47,9 @@ class AnonymizeResult:
     replaced_by_sheet: dict[str, int] = field(default_factory=dict)
     person_count: int = 0
     conflicts: list = field(default_factory=list)
+    skipped_token_cells: int = 0
+    new_persons: int = 0
+    reused_ids: int = 0
 
 
 @dataclass
@@ -156,7 +159,9 @@ class PersonColumns:
 
 @dataclass
 class PersonConflict:
-    kind: str  # "multi_id": 同一人物に複数の社員番号 / "multi_name": 同一社員番号に複数の氏名
+    # "multi_id": 同一人物に複数の社員番号 / "multi_name": 同一社員番号に複数の氏名
+    # "merge_existing": すでに別人としてIDを付けた2人が、追加シートで同一人物とつながった
+    kind: str
     values: list[str]
     context: list[str]
     locations: list[str]
@@ -165,6 +170,11 @@ class PersonConflict:
         if self.kind == "multi_id":
             who = "・".join(self.context) if self.context else "（氏名なし）"
             head = f"{who} に複数の社員番号: {' / '.join(self.values)}"
+        elif self.kind == "merge_existing":
+            head = (
+                f"すでに別のIDを付けた人が、追加シートでは同一人物になっています: {' / '.join(self.values)}"
+                "（IDは統合されず、別々のまま残ります）"
+            )
         else:
             head = f"社員番号 {' / '.join(self.context)} に複数の氏名: {' / '.join(self.values)}"
         return f"{head}\n    場所: {', '.join(self.locations)}"
@@ -210,13 +220,61 @@ def anonymize_workbook(
     )
 
 
-class _Node:
-    __slots__ = ("key", "original", "is_number", "locations")
+_TOKEN_PARTS_RE = re.compile(r"^PII_([A-Z0-9]{6})_([0-9]{6})(?:_([EN])([0-9]+))?$")
+# Excelセル内の仮IDを探す（日本語の文字が隣接していても拾えるよう、単語境界は使わない）
+_LOOSE_TOKEN_RE = re.compile(r"PII_[A-Z0-9]{6}_[0-9]{6}(?:_[EN][0-9]+)?")
 
-    def __init__(self, key: str, original: str, is_number: bool):
+
+def _value_kind(value) -> str:
+    """セルの元の型。復元時に数値や日付を元の型へ戻すために対応表へ記録する。"""
+    if isinstance(value, bool):
+        return "b"
+    if isinstance(value, int):
+        return "i"
+    if isinstance(value, float):
+        return "i" if value.is_integer() else "f"
+    if isinstance(value, datetime):
+        return "dt"
+    if isinstance(value, date):
+        return "d"
+    if isinstance(value, time):
+        return "t"
+    return "s"
+
+
+def _restore_value(text: str, kind: str):
+    try:
+        if kind == "i":
+            return int(text)
+        if kind == "f":
+            return float(text)
+        if kind == "b":
+            return text == "True"
+        if kind == "dt":
+            return datetime.fromisoformat(text)
+        if kind == "d":
+            return date.fromisoformat(text)
+        if kind == "t":
+            return time.fromisoformat(text)
+    except ValueError:
+        pass
+    return text
+
+
+class _Node:
+    __slots__ = ("key", "original", "is_number", "locations", "existing", "token", "group", "kind")
+
+    def __init__(
+        self, key: str, original: str, is_number: bool, kind: str = "s",
+        existing: bool = False, token: str | None = None, group: int | None = None,
+    ):
         self.key = key
         self.original = original
         self.is_number = is_number
+        self.kind = kind
+        self.existing = existing  # 既存の対応表に載っている値
+        self.token = token
+        self.group = group
         self.locations: list[str] = []
 
 
@@ -228,6 +286,8 @@ def anonymize_workbook_multi(
     password: str | None = None,
     person_columns: Iterable[PersonColumns] = (),
     allow_conflicts: bool = False,
+    base_map_path: str | Path | None = None,
+    base_map_password: str | None = None,
 ) -> AnonymizeResult:
     """複数シートをまとめて匿名化する。
 
@@ -237,6 +297,11 @@ def anonymize_workbook_multi(
     同じ値（空白・全角半角の違いは無視）は、シートをまたいでも同じ人物になる。
     同一人物に複数の社員番号（または同一社員番号に複数の氏名）があると PersonConflictError を送出する。
     allow_conflicts=True なら、同一人物としてまとめて続行する。
+
+    base_map_path: 匿名化済みExcelに追加したシートを匿名化するときの、既存の対応表。
+        既存のIDはそのまま引き継ぎ（同じ人には同じID）、新しい人には続き番号を振る。
+        すでに匿名化済みのセルは、指定された範囲に含まれていても変更しない。
+        出力の対応表（map_path）には、既存の内容に今回の分を加えたものが保存される。
     """
     source = Path(input_path)
     destination = Path(output_path)
@@ -266,6 +331,14 @@ def anonymize_workbook_multi(
     if not sheet_ranges and not persons:
         raise PrivacyToolError("1つ以上のシートと範囲、または人物の列を指定してください。")
 
+    base: dict | None = None
+    if base_map_path is not None:
+        if Path(base_map_path).resolve() == mapping_destination.resolve():
+            raise PrivacyToolError("更新後の対応表は、元の対応表とは別のファイル名で保存してください。")
+        base = load_mapping(base_map_path, base_map_password)
+        if not base.get("values"):
+            raise PrivacyToolError("既存の対応表に復元データがありません。")
+
     try:
         workbook = load_workbook(source)
     except Exception as exc:
@@ -278,7 +351,7 @@ def anonymize_workbook_multi(
     parent: dict[str, str] = {}
     cell_refs: list[tuple[str, str, str]] = []  # (sheet, coordinate, node key)
     processed: dict[str, set[str]] = {}
-    counters = {"blank": 0, "formula": 0}
+    counters = {"blank": 0, "formula": 0, "token": 0}
 
     def find(key: str) -> str:
         while parent[key] != key:
@@ -290,6 +363,49 @@ def anonymize_workbook_multi(
         ra, rb = find(a), find(b)
         if ra != rb:
             parent[rb] = ra
+
+    # 既存の対応表のIDを読み込む（IDは固定。同じグループ＝同一人物としてつなぐ）
+    base_values: dict[str, str] = {}
+    token_roles: dict[str, str] = {}
+    token_kinds: dict[str, str] = {}
+    group_counters: dict[int, dict[str, int]] = {}
+    max_group_no = 0
+    prefix = secrets.token_hex(3).upper()
+    if base is not None:
+        base_values = {str(t): str(v) for t, v in base["values"].items()}
+        token_roles = dict(base.get("token_roles") or {})
+        token_kinds = dict(base.get("kinds") or {})
+        match = _TOKEN_PARTS_RE.match(next(iter(base_values)))
+        if match:
+            prefix = match.group(1)
+        elif str(base.get("token_prefix", "")).startswith("PII_"):
+            prefix = str(base["token_prefix"])[4:10]
+        anchors: dict[int, str] = {}
+        for token, original in base_values.items():
+            parts = _TOKEN_PARTS_RE.match(token)
+            if not parts or parts.group(1) != prefix:
+                continue
+            group_no = int(parts.group(2))
+            max_group_no = max(max_group_no, group_no)
+            counter = group_counters.setdefault(group_no, {"E": 0, "N": 1})
+            if parts.group(3):
+                counter[parts.group(3)] = max(counter[parts.group(3)], int(parts.group(4)))
+            role = token_roles.get(token)
+            is_number = (role == "number") if role else parts.group(3) == "E"
+            key = _identity_key(original)
+            node = nodes.get(key)
+            if node is None:
+                node = nodes[key] = _Node(
+                    key, original, is_number, token_kinds.get(token, "s"),
+                    existing=True, token=token, group=group_no,
+                )
+                parent[key] = key
+            if node.group != group_no:
+                continue  # 表記ゆれで同じキーになった別グループは、つながない
+            if group_no in anchors:
+                union(anchors[group_no], key)
+            else:
+                anchors[group_no] = key
 
     def visit(sheet_name: str, cell, is_number: bool) -> str | None:
         done = processed.setdefault(sheet_name, set())
@@ -303,13 +419,16 @@ def anonymize_workbook_multi(
         if cell.data_type == "f" or (isinstance(value, str) and value.startswith("=")):
             counters["formula"] += 1
             return None
+        if isinstance(value, str) and TOKEN_RE.fullmatch(value.strip()):
+            counters["token"] += 1  # すでに匿名化済みのセルは触らない
+            return None
         original = _cell_text(value)
         key = _identity_key(original)
         node = nodes.get(key)
         if node is None:
-            node = nodes[key] = _Node(key, original, is_number)
+            node = nodes[key] = _Node(key, original, is_number, _value_kind(value))
             parent[key] = key
-        elif not is_number:
+        elif not is_number and not node.existing:
             node.is_number = False
         node.locations.append(f"{sheet_name}!{cell.coordinate}")
         cell_refs.append((sheet_name, cell.coordinate, key))
@@ -343,46 +462,83 @@ def anonymize_workbook_multi(
                     visit(sheet_name, cell, False)
 
     if not cell_refs:
+        if counters["token"]:
+            raise PrivacyToolError(
+                "指定した範囲は、すでに匿名化済みのセルばかりでした。追加したシートの範囲を指定してください。"
+            )
         raise PrivacyToolError("置換できるセルがありませんでした。範囲を確認してください。")
 
     # 人物（連結成分）ごとにまとめる。出現順を保つ
-    groups: dict[str, list[_Node]] = {}
+    components: dict[str, list[_Node]] = {}
     for key, node in nodes.items():
-        groups.setdefault(find(key), []).append(node)
+        components.setdefault(find(key), []).append(node)
 
     conflicts: list[PersonConflict] = []
-    for members in groups.values():
+    for members in components.values():
+        existing_groups = sorted({n.group for n in members if n.existing})
+        has_new = any(not n.existing for n in members)
+        locations = [loc for n in members for loc in n.locations[:2]]
+        if len(existing_groups) >= 2:
+            labels = []
+            for group_no in existing_groups:
+                group_nodes = [n for n in members if n.existing and n.group == group_no]
+                labels.append(min(group_nodes, key=lambda n: len(n.token or "")).original)
+            conflicts.append(PersonConflict("merge_existing", labels, [], locations))
+        if not has_new:
+            continue
         numbers = [n for n in members if n.is_number]
         names = [n for n in members if not n.is_number]
         if len(numbers) >= 2:
             conflicts.append(PersonConflict(
-                "multi_id", [n.original for n in numbers], [n.original for n in names],
-                [loc for n in members for loc in n.locations[:2]],
+                "multi_id", [n.original for n in numbers], [n.original for n in names], locations,
             ))
         if len(names) >= 2 and numbers:
             conflicts.append(PersonConflict(
-                "multi_name", [n.original for n in names], [n.original for n in numbers],
-                [loc for n in members for loc in n.locations[:2]],
+                "multi_name", [n.original for n in names], [n.original for n in numbers], locations,
             ))
     if conflicts and not allow_conflicts:
         raise PersonConflictError(conflicts)
 
-    prefix = secrets.token_hex(3).upper()
     node_token: dict[str, str] = {}
-    token_to_original: dict[str, str] = {}
-    for index, members in enumerate(groups.values(), start=1):
-        base = f"PII_{prefix}_{index:06d}"
-        names = [n for n in members if not n.is_number]
-        numbers = [n for n in members if n.is_number]
-        primary = names[0] if names else numbers[0]
-        node_token[primary.key] = base
-        token_to_original[base] = primary.original
-        for position, node in enumerate(names[1:], start=2):
-            node_token[node.key] = f"{base}_N{position}"
-            token_to_original[node_token[node.key]] = node.original
-        for position, node in enumerate([n for n in numbers if n is not primary], start=1):
-            node_token[node.key] = f"{base}_E{position}"
-            token_to_original[node_token[node.key]] = node.original
+    token_to_original: dict[str, str] = dict(base_values)
+    new_persons = 0
+    next_group_no = max_group_no
+    for members in components.values():
+        existing_nodes = [n for n in members if n.existing]
+        new_nodes = [n for n in members if not n.existing]
+        for node in existing_nodes:
+            node_token[node.key] = node.token or ""
+        if not new_nodes:
+            continue
+
+        def assign(node: _Node, token: str) -> None:
+            node_token[node.key] = token
+            token_to_original[token] = node.original
+            token_roles[token] = "number" if node.is_number else "name"
+            if node.kind != "s":
+                token_kinds[token] = node.kind
+
+        if existing_nodes:
+            # 既存の人物に新しい値がつながった。既存のIDは変えず、枝番を続きから振る
+            anchor = min(n.group for n in existing_nodes)
+            base_token = f"PII_{prefix}_{anchor:06d}"
+            counter = group_counters.setdefault(anchor, {"E": 0, "N": 1})
+            for node in new_nodes:
+                letter = "E" if node.is_number else "N"
+                counter[letter] += 1
+                assign(node, f"{base_token}_{letter}{counter[letter]}")
+        else:
+            next_group_no += 1
+            new_persons += 1
+            base_token = f"PII_{prefix}_{next_group_no:06d}"
+            names = [n for n in new_nodes if not n.is_number]
+            numbers = [n for n in new_nodes if n.is_number]
+            primary = names[0] if names else numbers[0]
+            assign(primary, base_token)
+            for position, node in enumerate(names[1:], start=2):
+                assign(node, f"{base_token}_N{position}")
+            for position, node in enumerate([n for n in numbers if n is not primary], start=1):
+                assign(node, f"{base_token}_E{position}")
 
     cell_records: list[dict[str, str]] = []
     replaced_by_sheet: dict[str, int] = {}
@@ -392,28 +548,38 @@ def anonymize_workbook_multi(
         cell_records.append({"sheet": sheet_name, "cell": coordinate, "token": token})
         replaced_by_sheet[sheet_name] = replaced_by_sheet.get(sheet_name, 0) + 1
 
+    now = datetime.now(timezone.utc).isoformat()
+    new_targets = [{"sheet": name, "ranges": r} for name, r in sheet_ranges.items()]
+    new_person_columns = [
+        {
+            "sheet": spec.sheet, "name_col": spec.name_col, "id_col": spec.id_col,
+            "first_row": spec.first_row, "last_row": spec.last_row,
+        }
+        for spec, _, _ in persons
+    ]
     first_sheet = next(iter(sheet_ranges), None) or persons[0][0].sheet
     mapping = {
         "schema": 1,
         "app": APP_NAME,
         "app_version": APP_VERSION,
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        "source_filename": source.name,
+        "created_at": base.get("created_at", now) if base else now,
+        "source_filename": base.get("source_filename", source.name) if base else source.name,
         "anonymized_filename": destination.name,
-        "sheet": first_sheet,
-        "ranges": sheet_ranges.get(first_sheet, []),
-        "targets": [{"sheet": name, "ranges": r} for name, r in sheet_ranges.items()],
-        "person_columns": [
-            {
-                "sheet": spec.sheet, "name_col": spec.name_col, "id_col": spec.id_col,
-                "first_row": spec.first_row, "last_row": spec.last_row,
-            }
-            for spec, _, _ in persons
-        ],
+        "sheet": base.get("sheet", first_sheet) if base else first_sheet,
+        "ranges": base.get("ranges", []) if base else sheet_ranges.get(first_sheet, []),
+        "targets": (base.get("targets", []) if base else []) + new_targets,
+        "person_columns": (base.get("person_columns", []) if base else []) + new_person_columns,
         "token_prefix": f"PII_{prefix}_",
         "values": token_to_original,
-        "cells": cell_records,
+        "token_roles": token_roles,
+        "kinds": token_kinds,
+        "cells": (base.get("cells", []) if base else []) + cell_records,
     }
+    if base is not None:
+        mapping["updated_at"] = now
+        mapping["updates"] = list(base.get("updates", [])) + [
+            {"at": now, "app_version": APP_VERSION, "sheets": list(replaced_by_sheet)}
+        ]
 
     try:
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -424,6 +590,9 @@ def anonymize_workbook_multi(
             destination.unlink(missing_ok=True)
         raise PrivacyToolError(f"ファイルを保存できません: {exc}") from exc
 
+    group_numbers = {
+        int(parts.group(2)) for t in token_to_original if (parts := _TOKEN_PARTS_RE.match(t))
+    }
     return AnonymizeResult(
         output_path=str(destination),
         map_path=str(mapping_destination),
@@ -432,8 +601,96 @@ def anonymize_workbook_multi(
         skipped_blank_cells=counters["blank"],
         skipped_formula_cells=counters["formula"],
         replaced_by_sheet=replaced_by_sheet,
-        person_count=len(groups),
+        person_count=len(group_numbers),
         conflicts=conflicts,
+        skipped_token_cells=counters["token"],
+        new_persons=new_persons,
+        reused_ids=sum(1 for n in nodes.values() if n.existing and n.locations),
+    )
+
+
+@dataclass
+class WorkbookRestoreResult:
+    output_path: str
+    restored_cells: int
+    restored_by_sheet: dict[str, int]
+    skipped_formula_cells: int
+    missing_expected_tokens: list[str]
+    unknown_tokens: list[str]
+
+
+def restore_workbook(
+    input_path: str | Path,
+    map_path: str | Path,
+    output_path: str | Path,
+    password: str | None = None,
+) -> WorkbookRestoreResult:
+    """匿名化済みExcelの仮IDを、対応表を使って元の値に戻す（全シート対象）。"""
+    source = Path(input_path)
+    destination = Path(output_path)
+    if source.resolve() == destination.resolve():
+        raise PrivacyToolError("入力ファイルと出力ファイルは別名にしてください。")
+    mapping = load_mapping(map_path, password)
+    values: dict[str, str] = mapping.get("values") or {}
+    kinds: dict[str, str] = mapping.get("kinds") or {}
+    if not values:
+        raise PrivacyToolError("対応表に復元データがありません。")
+    try:
+        workbook = load_workbook(source)
+    except Exception as exc:
+        raise PrivacyToolError(f"Excelファイルを開けません: {exc}") from exc
+
+    present: set[str] = set()
+    unknown: set[str] = set()
+    restored_by_sheet: dict[str, int] = {}
+    formulas = 0
+
+    def replace_in_text(match: re.Match) -> str:
+        token = match.group(0)
+        if token in values:
+            present.add(token)
+            return str(values[token])
+        unknown.add(token)
+        return token
+
+    for sheet in workbook.worksheets:
+        for row in sheet.iter_rows():
+            for cell in row:
+                value = cell.value
+                if not isinstance(value, str) or "PII_" not in value:
+                    continue
+                if cell.data_type == "f" or value.startswith("="):
+                    formulas += 1
+                    continue
+                stripped = value.strip()
+                if stripped in values:
+                    present.add(stripped)
+                    cell.value = _restore_value(str(values[stripped]), kinds.get(stripped, "s"))
+                else:
+                    replaced = _LOOSE_TOKEN_RE.sub(replace_in_text, value)
+                    if replaced == value:
+                        continue
+                    cell.value = replaced
+                restored_by_sheet[sheet.title] = restored_by_sheet.get(sheet.title, 0) + 1
+
+    if not restored_by_sheet:
+        raise PrivacyToolError(
+            "このExcelには、対応表に載っている仮IDが見つかりませんでした。"
+            "匿名化後のExcelと、対応する対応表の組み合わせを確認してください。"
+        )
+    try:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        workbook.save(destination)
+    except Exception as exc:
+        raise PrivacyToolError(f"復元Excelを保存できません: {exc}") from exc
+
+    return WorkbookRestoreResult(
+        output_path=str(destination),
+        restored_cells=sum(restored_by_sheet.values()),
+        restored_by_sheet=restored_by_sheet,
+        skipped_formula_cells=formulas,
+        missing_expected_tokens=sorted(set(values) - present),
+        unknown_tokens=sorted(unknown),
     )
 
 
